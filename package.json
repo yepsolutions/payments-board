@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "deploy": "npm run build && npx @mondaycom/apps-cli code:push -d ./dist -a 11007042",
+    "deploy:versions": "npx @mondaycom/apps-cli app-version:list -a 11007042"
   },
   "dependencies": {
     "express": "^4.21.0"

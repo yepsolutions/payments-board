@@ -5,6 +5,8 @@ export const CONTRACTUAL_PAYMENTS = {
     indexationPaymentDue: "numeric_mm14mht9",
     interestPaymentDue: "numeric_mm184vaa",
     interestPercent: "numeric_mm19xy22",
+    /** Contract link column - links to the same contract as Actual Payments */
+    contractLink: "board_relation_mm0tcdy3",
   } as const,
   subitems: {
     boardId: "5092168551",
