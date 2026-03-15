@@ -3,6 +3,9 @@ import { mondayWebhookAuth } from '../middleware/mondayAuth';
 import { logger } from '../logger';
 import { applyPayment } from '../services/paymentAllocation';
 import { ACTUAL_PAYMENTS } from '../config/config';
+import { fetchCbsIndex, getLatestConstructionIndex, CBS_INDEX_CODES } from '../services/cbsApi';
+import { createIndexItem } from '../services/indexBoard';
+import { INDEX_BOARD } from '../config/config';
 
 const router = Router();
 
@@ -38,6 +41,8 @@ function getActualPaymentItemId(event: Record<string, unknown>): string | null {
 
 router.post('/apply-payment', mondayWebhookAuth, applyPaymentHandler);
 router.post('/apply-payment/', mondayWebhookAuth, applyPaymentHandler);
+
+router.post('/get-index', getIndexHandler);
 
 async function applyPaymentHandler(req: Request, res: Response) {
   const body = req.body;
@@ -85,6 +90,88 @@ async function applyPaymentHandler(req: Request, res: Response) {
   } catch (err) {
     logger.warn('Payment application error', { itemId, err });
     return res.status(500).json({
+      error: err instanceof Error ? err.message : 'Internal server error',
+    });
+  }
+}
+
+async function getIndexHandler(req: Request, res: Response) {
+  if (req.body?.challenge) {
+    logger.info('get-index: webhook challenge received');
+    return res.status(200).json({ challenge: req.body.challenge });
+  }
+
+  const updateDate = new Date().toISOString().slice(0, 10);
+
+  try {
+    logger.info('get-index: fetching CBS indices');
+
+    const [constructionResult, consumerResult] = await Promise.all([
+      getLatestConstructionIndex(),
+      fetchCbsIndex(CBS_INDEX_CODES.CONSUMER_PRICE, 'Consumer Price Index'),
+    ]);
+
+    if (!constructionResult.success || !constructionResult.latest) {
+      logger.warn('get-index: Construction Input fetch failed', constructionResult);
+      return res.status(502).json({
+        success: false,
+        error: constructionResult.error ?? 'Failed to fetch Construction Input Price Index',
+        details: { construction: constructionResult, consumer: consumerResult },
+      });
+    }
+
+    if (!consumerResult.success || !consumerResult.latest) {
+      logger.warn('get-index: Consumer Price fetch failed', consumerResult);
+      return res.status(502).json({
+        success: false,
+        error: consumerResult.error ?? 'Failed to fetch Consumer Price Index',
+        details: { construction: constructionResult, consumer: consumerResult },
+      });
+    }
+
+    logger.info('get-index: creating Monday items', {
+      construction: constructionResult.latest,
+      consumer: consumerResult.latest,
+    });
+
+    const [constructionItem, consumerItem] = await Promise.all([
+      createIndexItem(
+        INDEX_BOARD.groups.constructionInput,
+        constructionResult.latest,
+        updateDate
+      ),
+      createIndexItem(
+        INDEX_BOARD.groups.consumerPrice,
+        consumerResult.latest,
+        updateDate
+      ),
+    ]);
+
+    if (!constructionItem.success || !consumerItem.success) {
+      const errors = [
+        constructionItem.error && `Construction: ${constructionItem.error}`,
+        consumerItem.error && `Consumer: ${consumerItem.error}`,
+      ].filter(Boolean);
+      return res.status(500).json({
+        success: false,
+        error: errors.join('; '),
+        constructionItemId: constructionItem.itemId,
+        consumerItemId: consumerItem.itemId,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      constructionItemId: constructionItem.itemId,
+      consumerItemId: consumerItem.itemId,
+      constructionIndex: constructionResult.latest,
+      consumerIndex: consumerResult.latest,
+      updateDate,
+    });
+  } catch (err) {
+    logger.warn('get-index error', { err });
+    return res.status(500).json({
+      success: false,
       error: err instanceof Error ? err.message : 'Internal server error',
     });
   }

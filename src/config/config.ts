@@ -39,6 +39,19 @@ export const ACTUAL_PAYMENTS = {
   } as const,
 } as const;
 
+/** Index values board - stores CBS price indices (CPI, Construction Input) */
+export const INDEX_BOARD = {
+  boardId: "5092654858",
+  groups: {
+    constructionInput: "topics",
+    consumerPrice: "group_title",
+  } as const,
+  columns: {
+    indexValue: "numeric_mm14kv1j",
+    updateDate: "date4",
+  } as const,
+} as const;
+
 export type ContractualPaymentsItemColumnKey = keyof typeof CONTRACTUAL_PAYMENTS.items;
 export type ContractualPaymentsSubitemColumnKey = keyof typeof CONTRACTUAL_PAYMENTS.subitems;
 export type ActualPaymentsColumnKey = keyof typeof ACTUAL_PAYMENTS.columns;
