@@ -384,6 +384,7 @@ function getIndexPeriodForPaymentDate(paymentDate: string): string {
 
   let targetMonth: number;
   let targetYear: number;
+  const rule = day < 15 ? 'before_15th_use_2_months_earlier' : 'on_or_after_15th_use_previous_month';
 
   if (day < 15) {
     targetMonth = month - 2;
@@ -398,7 +399,23 @@ function getIndexPeriodForPaymentDate(paymentDate: string): string {
     targetYear--;
   }
 
-  return `${String(targetMonth).padStart(2, '0')}-${targetYear}`;
+  const targetPeriod = `${String(targetMonth).padStart(2, '0')}-${targetYear}`;
+
+  logger.info('Index period for payment date', {
+    rule: 'Index published on 15th for previous month',
+    paymentDate,
+    paymentDay: day,
+    paymentMonth: month,
+    paymentYear: year,
+    appliedRule: rule,
+    targetPeriod,
+    explanation:
+      day < 15
+        ? `Payment before 15th → use index of 2 months earlier (${month}-${year} → ${targetPeriod})`
+        : `Payment on/after 15th → use index of previous month (${month}-${year} → ${targetPeriod})`,
+  });
+
+  return targetPeriod;
 }
 
 // ─── Fetch index from Monday Indices board for payment date ──────────────────
@@ -475,7 +492,12 @@ export async function fetchIndexForPaymentDate(
     return null;
   }
 
-  logger.info('Index for payment date', { paymentDate, targetPeriod, value: match.value });
+  logger.info('Index fetched for payment date', {
+    paymentDate,
+    targetPeriod,
+    currentIndex: match.value,
+    source: `Indices board 5092654858, item "${match.period}"`,
+  });
   return { value: match.value, period: match.period };
 }
 
@@ -727,6 +749,16 @@ export async function computeBalancesBeforePayment(
     paymentDate
   );
   const remainingInterestBefore = round(calculatedInterest + previous.remainingInterest);
+
+  logger.info('Indexation inputs', {
+    formula: 'Indexation = Remaining_Principal × (Current_Index / Base_Index - 1)',
+    remainingPrincipal: remainingPrincipalBefore,
+    currentIndex,
+    baseIndex,
+    currentIndexSource: 'Indices board, determined by payment date (published 15th for previous month)',
+    baseIndexSource: 'Contracts board, from linked contract',
+    previousRemainingIndexation: previous.remainingIndexation,
+  });
 
   const calculatedIndexation = computeIndexationBalance(
     remainingPrincipalBefore,
