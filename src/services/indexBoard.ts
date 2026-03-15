@@ -46,13 +46,6 @@ export async function createIndexItem(
   `;
 
   try {
-    logger.info('Creating Monday index item', {
-      boardId: INDEX_BOARD.boardId,
-      groupId,
-      itemName,
-      columnValues,
-    });
-
     const data = await mondayQuery<{
       create_item: { id: string; name: string };
     }>(mutation, {
@@ -63,8 +56,6 @@ export async function createIndexItem(
     });
 
     const item = data.create_item;
-    logger.info('Monday create_item result', { itemId: item.id, name: item.name });
-
     return { success: true, itemId: item.id };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

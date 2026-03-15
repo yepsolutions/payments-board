@@ -41,9 +41,6 @@ function getActualPaymentItemId(event: Record<string, unknown>): string | null {
 
 router.post('/apply-payment', mondayWebhookAuth, applyPaymentHandler);
 router.post('/apply-payment/', mondayWebhookAuth, applyPaymentHandler);
-
-router.post('/get-index', getIndexHandler);
-
 async function applyPaymentHandler(req: Request, res: Response) {
   const body = req.body;
 
@@ -95,6 +92,7 @@ async function applyPaymentHandler(req: Request, res: Response) {
   }
 }
 
+router.post('/get-index', getIndexHandler);
 async function getIndexHandler(req: Request, res: Response) {
   if (req.body?.challenge) {
     logger.info('get-index: webhook challenge received');
@@ -128,11 +126,6 @@ async function getIndexHandler(req: Request, res: Response) {
         details: { construction: constructionResult, consumer: consumerResult },
       });
     }
-
-    logger.info('get-index: creating Monday items', {
-      construction: constructionResult.latest,
-      consumer: consumerResult.latest,
-    });
 
     const [constructionItem, consumerItem] = await Promise.all([
       createIndexItem(

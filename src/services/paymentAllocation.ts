@@ -1,6 +1,10 @@
 /**
  * Payment allocation logic: allocates actual payments across contractual payment items
- * in order: Indexation → Interest → Principal.
+ * in order: Interest → Indexation → Principal.
+ *
+ * Interest and indexation balances are calculated per payment from:
+ * - Interest: Remaining_Principal × (r/365) × Late_Days + previous remaining interest
+ * - Indexation: Remaining_Principal × (Current_Index/Base_Index - 1) + previous remaining indexation
  */
 
 import { mondayQuery } from './mondayApi';
@@ -8,6 +12,8 @@ import { logger } from '../logger';
 import {
   ACTUAL_PAYMENTS,
   CONTRACTUAL_PAYMENTS,
+  CONTRACTS_BOARD,
+  INDEX_BOARD,
 } from '../config/config';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -25,10 +31,8 @@ export interface ContractualPaymentItem {
   paymentOrder: number; // 1, 2, 3, 4... from item name
   paymentDue: number;
   indexationPaymentDue: number;
-  interestPaymentDue: number;
   principal: number;
-  interest: number;
-  indexation: number;
+  contractualDueDate: string | null;
 }
 
 export interface RemainingBalances {
@@ -47,6 +51,12 @@ export interface AllocationResult {
   amountUsed: number;
 }
 
+export interface BalancesBeforePayment {
+  remainingPrincipalBefore: number;
+  remainingInterestBefore: number;
+  remainingIndexationBefore: number;
+}
+
 export interface SubitemPayload {
   name: string;
   columnValues: Record<string, unknown>;
@@ -58,6 +68,17 @@ const ROUND = 2;
 
 function round(value: number): number {
   return Math.round(value * 10 ** ROUND) / 10 ** ROUND;
+}
+
+/** Format date for subitem name: "Mar 1, 2026" */
+function formatDateForDisplay(dateStr: string): string {
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return dateStr;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[d.getMonth()];
+  const day = d.getDate();
+  const year = d.getFullYear();
+  return `${month} ${day}, ${year}`;
 }
 
 /** Parse linked item IDs from board relation column value (handles various API formats) */
@@ -195,6 +216,14 @@ export async function findMatchingContractualItems(
   const allItems: Array<{ id: string; name: string; column_values: ContractualColumnValue[] }> = [];
   let cursor: string | null = null;
 
+  const columnIds = [
+    CONTRACTUAL_PAYMENTS.items.contractLink,
+    CONTRACTUAL_PAYMENTS.items.paymentDue,
+    CONTRACTUAL_PAYMENTS.items.principalDue,
+    CONTRACTUAL_PAYMENTS.items.indexationPaymentDue,
+    CONTRACTUAL_PAYMENTS.items.contractualDueDate,
+  ].join('", "');
+
   do {
     const query: string = cursor
       ? `
@@ -204,7 +233,7 @@ export async function findMatchingContractualItems(
             items {
                 id
                 name
-                column_values(ids: ["${CONTRACTUAL_PAYMENTS.items.contractLink}", "${CONTRACTUAL_PAYMENTS.items.paymentDue}", "${CONTRACTUAL_PAYMENTS.items.indexationPaymentDue}", "${CONTRACTUAL_PAYMENTS.items.interestPaymentDue}"]) {
+                column_values(ids: ["${columnIds}"]) {
                 id
                 value
                 ... on BoardRelationValue {
@@ -223,7 +252,7 @@ export async function findMatchingContractualItems(
             items {
                 id
                 name
-                column_values(ids: ["${CONTRACTUAL_PAYMENTS.items.contractLink}", "${CONTRACTUAL_PAYMENTS.items.paymentDue}", "${CONTRACTUAL_PAYMENTS.items.indexationPaymentDue}", "${CONTRACTUAL_PAYMENTS.items.interestPaymentDue}"]) {
+                column_values(ids: ["${columnIds}"]) {
                 id
                 value
                 ... on BoardRelationValue {
@@ -286,27 +315,35 @@ export async function findMatchingContractualItems(
 
   const contractual: ContractualPaymentItem[] = items.map((item) => {
     let paymentDue = 0;
+    let principalDue = 0;
     let indexationPaymentDue = 0;
-    let interestPaymentDue = 0;
+    let contractualDueDate: string | null = null;
 
     for (const cv of item.column_values) {
       try {
         const parsed = JSON.parse(cv.value || '{}');
-        const val = parseFloat(parsed.value ?? parsed) || 0;
-        if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
-        else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
-        else if (cv.id === CONTRACTUAL_PAYMENTS.items.interestPaymentDue) interestPaymentDue = val;
+        if (cv.id === CONTRACTUAL_PAYMENTS.items.contractualDueDate) {
+          contractualDueDate = parsed.date ?? null;
+        } else {
+          const val = parseFloat(parsed.value ?? parsed) || 0;
+          if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalDue) principalDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
+        }
       } catch {
-        const val = parseFloat(cv.value ?? '') || 0;
-        if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
-        else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
-        else if (cv.id === CONTRACTUAL_PAYMENTS.items.interestPaymentDue) interestPaymentDue = val;
+        if (cv.id === CONTRACTUAL_PAYMENTS.items.contractualDueDate) {
+          contractualDueDate = cv.value ?? null;
+        } else {
+          const val = parseFloat(cv.value ?? '') || 0;
+          if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalDue) principalDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
+        }
       }
     }
 
-    const principal = round(Math.max(0, paymentDue - indexationPaymentDue - interestPaymentDue));
-    const interest = round(interestPaymentDue);
-    const indexation = round(indexationPaymentDue);
+    // Principal for first subitem comes from contractual principal column (numeric_mm0tv8dx)
+    const principal = round(Math.max(0, principalDue || paymentDue));
     const paymentOrder = parsePaymentOrder(item.name ?? '');
 
     return {
@@ -315,10 +352,8 @@ export async function findMatchingContractualItems(
       paymentOrder,
       paymentDue,
       indexationPaymentDue,
-      interestPaymentDue,
       principal,
-      interest,
-      indexation,
+      contractualDueDate,
     };
   });
 
@@ -334,21 +369,155 @@ export async function findMatchingContractualItems(
   return contractual;
 }
 
-// ─── Get current remaining balances for a contractual item ───────────────────
-// Uses latest subitem (by date) as source of truth. If no subitems, uses parent's original values.
+// ─── Fetch latest index from Monday Indices board ───────────────────────────
+/** Item name format: "01-2026" (MM-YYYY). Returns the latest published index. */
+export async function fetchLatestIndexFromMonday(): Promise<{ value: number; period: string } | null> {
+  const col = INDEX_BOARD.columns.indexValue;
+  const allItems: Array<{ name: string; column_values: Array<{ id: string; value: string }> }> = [];
+  let cursor: string | null = null;
 
-export async function getRemainingBalances(
+  type Page = { cursor: string | null; items: typeof allItems };
+
+  do {
+    const queryStr: string = cursor
+      ? `
+        query GetIndexItemsNext($cursor: String!) {
+          next_items_page(cursor: $cursor, limit: 500) {
+            cursor
+            items { name column_values(ids: ["${col}"]) { id value } }
+          }
+        }
+      `
+      : `
+        query GetIndexItems($boardId: ID!) {
+          boards(ids: [$boardId]) {
+            items_page(limit: 500) {
+              cursor
+              items { name column_values(ids: ["${col}"]) { id value } }
+            }
+          }
+        }
+      `;
+
+    let page: Page | undefined;
+    if (cursor) {
+      const res: { next_items_page: Page } = await mondayQuery(queryStr, { cursor });
+      page = res.next_items_page;
+    } else {
+      const res: { boards: Array<{ items_page: Page }> } = await mondayQuery(queryStr, { boardId: INDEX_BOARD.boardId });
+      page = res.boards?.[0]?.items_page;
+    }
+    cursor = page?.cursor ?? null;
+    allItems.push(...(page?.items ?? []));
+  } while (cursor);
+
+  const withPeriod = allItems
+    .map((item) => {
+      const m = item.name?.trim().match(/^(\d{1,2})-(\d{4})$/);
+      if (!m) return null;
+      const [, mm, yyyy] = m;
+      const period = `${mm!.padStart(2, '0')}-${yyyy}`;
+      const cv = item.column_values.find((c) => c.id === col);
+      let value = 0;
+      if (cv?.value) {
+        try {
+          const parsed = JSON.parse(cv.value);
+          value = parseFloat(parsed.value ?? parsed) || 0;
+        } catch {
+          value = parseFloat(cv.value) || 0;
+        }
+      }
+      return { period, value, sortKey: `${yyyy}-${mm}` };
+    })
+    .filter((x): x is NonNullable<typeof x> => x != null && x.value > 0);
+
+  if (withPeriod.length === 0) {
+    logger.warn('No valid index items found in Indices board');
+    return null;
+  }
+
+  const latest = withPeriod.sort((a, b) => b.sortKey.localeCompare(a.sortKey))[0];
+  logger.info('Latest index from Monday', { period: latest.period, value: latest.value });
+  return { value: latest.value, period: latest.period };
+}
+
+// ─── Fetch contract details (interest rate, base index) ──────────────────────
+
+export interface ContractDetails {
+  interestRatePercent: number;
+  baseIndex: number;
+}
+
+export async function fetchContractDetails(contractId: number): Promise<ContractDetails | null> {
+  const irCol = CONTRACTS_BOARD.columns.interestRatePercent;
+  const biCol = CONTRACTS_BOARD.columns.baseIndex;
+
+  const query = `
+    query GetContract($itemId: ID!) {
+      items(ids: [$itemId]) {
+        id
+        column_values(ids: ["${irCol}", "${biCol}"]) {
+          id
+          value
+        }
+      }
+    }
+  `;
+
+  const data = await mondayQuery<{ items: Array<{ column_values: Array<{ id: string; value: string }> }> }>(query, {
+    itemId: contractId,
+  });
+
+  const item = data.items?.[0];
+  if (!item) {
+    logger.warn('Contract not found', { contractId });
+    return null;
+  }
+
+  let interestRatePercent = 0;
+  let baseIndex = 100;
+
+  for (const cv of item.column_values) {
+    try {
+      const parsed = JSON.parse(cv.value || '{}');
+      const val = parseFloat(parsed.value ?? parsed) || 0;
+      if (cv.id === irCol) interestRatePercent = val;
+      else if (cv.id === biCol) baseIndex = val > 0 ? val : 100;
+    } catch {
+      const val = parseFloat(cv.value ?? '') || 0;
+      if (cv.id === irCol) interestRatePercent = val;
+      else if (cv.id === biCol) baseIndex = val > 0 ? val : 100;
+    }
+  }
+
+  logger.info('Contract details', {
+    contractId,
+    interestRateColumn: irCol,
+    interestRatePercent,
+    baseIndex,
+    rawColumnValues: item.column_values.map((cv) => ({ id: cv.id, value: cv.value })),
+  });
+  return { interestRatePercent, baseIndex };
+}
+
+// ─── Get previous subitem (the one before the next we create) ────────────────
+
+interface PreviousSubitemBalances {
+  remainingPrincipal: number;
+  remainingInterest: number;
+  remainingIndexation: number;
+}
+
+export async function getPreviousSubitemBalances(
   parentItemId: string,
-  parentOriginal: { principal: number; interest: number; indexation: number }
-): Promise<RemainingBalances> {
-  logger.info('Getting remaining balances for contractual item', { parentItemId });
-
+  parentOriginalPrincipal: number
+): Promise<PreviousSubitemBalances> {
+  const sub = CONTRACTUAL_PAYMENTS.subitems;
   const query = `
     query GetSubitems($parentId: ID!) {
       items(ids: [$parentId]) {
         subitems {
-          id
-          column_values(ids: ["${CONTRACTUAL_PAYMENTS.subitems.remainingPrincipal}", "${CONTRACTUAL_PAYMENTS.subitems.remainingInterest}", "${CONTRACTUAL_PAYMENTS.subitems.remainingIndexLinkage}"]) {
+          column_values(ids: ["${sub.remainingPrincipal}", "${sub.remainingInterest}", "${sub.remainingIndexLinkage}"]) {
             id
             value
           }
@@ -361,7 +530,6 @@ export async function getRemainingBalances(
   const data = await mondayQuery<{
     items: Array<{
       subitems: Array<{
-        id: string;
         column_values: Array<{ id: string; value: string }>;
         created_at: string;
       }>;
@@ -370,16 +538,18 @@ export async function getRemainingBalances(
 
   const subitems = data.items?.[0]?.subitems ?? [];
   if (subitems.length === 0) {
-    logger.info('No subitems yet, using parent original values as remaining', { parentItemId });
-    return { ...parentOriginal };
+    return {
+      remainingPrincipal: parentOriginalPrincipal,
+      remainingInterest: 0,
+      remainingIndexation: 0,
+    };
   }
 
-  // Use latest subitem (by created_at) as source of truth
   const latest = subitems.sort(
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   )[0];
 
-  let remainingPrincipal = 0;
+  let remainingPrincipal = parentOriginalPrincipal;
   let remainingInterest = 0;
   let remainingIndexation = 0;
 
@@ -387,23 +557,190 @@ export async function getRemainingBalances(
     try {
       const parsed = JSON.parse(cv.value || '{}');
       const val = round(parseFloat(parsed.value ?? parsed) || 0);
-      if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingPrincipal) remainingPrincipal = val;
-      else if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingInterest) remainingInterest = val;
-      else if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingIndexLinkage) remainingIndexation = val;
+      if (cv.id === sub.remainingPrincipal) remainingPrincipal = val;
+      else if (cv.id === sub.remainingInterest) remainingInterest = val;
+      else if (cv.id === sub.remainingIndexLinkage) remainingIndexation = val;
     } catch {
       const val = round(parseFloat(cv.value) || 0);
-      if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingPrincipal) remainingPrincipal = val;
-      else if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingInterest) remainingInterest = val;
-      else if (cv.id === CONTRACTUAL_PAYMENTS.subitems.remainingIndexLinkage) remainingIndexation = val;
+      if (cv.id === sub.remainingPrincipal) remainingPrincipal = val;
+      else if (cv.id === sub.remainingInterest) remainingInterest = val;
+      else if (cv.id === sub.remainingIndexLinkage) remainingIndexation = val;
     }
   }
 
-  logger.info('Remaining balances from latest subitem', { parentItemId, remainingPrincipal, remainingInterest, remainingIndexation });
-
-  return { principal: remainingPrincipal, interest: remainingInterest, indexation: remainingIndexation };
+  return { remainingPrincipal, remainingInterest, remainingIndexation };
 }
 
-// ─── Allocate payment amount by priority (indexation → interest → principal) ─
+// ─── Compute interest (7-day grace) ───────────────────────────────────────────
+const GRACE_DAYS = 7;
+
+function computeLateInterest(
+  remainingPrincipal: number,
+  interestRatePercent: number,
+  contractualDueDate: string | null,
+  paymentDate: string
+): number {
+  if (!contractualDueDate || remainingPrincipal <= 0) {
+    logger.info('Interest calculation skipped', {
+      reason: !contractualDueDate ? 'no contractual due date' : 'remaining principal <= 0',
+      remainingPrincipal,
+      contractualDueDate,
+    });
+    return 0;
+  }
+
+  const due = new Date(contractualDueDate);
+  const paid = new Date(paymentDate);
+  const diffMs = paid.getTime() - due.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffDays <= GRACE_DAYS) {
+    logger.info('Interest calculation: within grace period, no interest charged', {
+      formula: 'Interest = Remaining_Principal × (r / 365) × Late_Days',
+      values: {
+        remainingPrincipal,
+        interestRatePercent: `${interestRatePercent}%`,
+        r: interestRatePercent / 100,
+        contractualDueDate,
+        paymentDate,
+        diffDays,
+        gracePeriodDays: GRACE_DAYS,
+      },
+      result: 0,
+    });
+    return 0;
+  }
+
+  const r = interestRatePercent / 100;
+  const interest = remainingPrincipal * (r / 365) * diffDays;
+  const result = round(interest);
+
+  logger.info('Interest calculation', {
+    formula: 'Interest = Remaining_Principal × (r / 365) × Late_Days',
+    values: {
+      remainingPrincipal,
+      interestRatePercent: `${interestRatePercent}%`,
+      r,
+      contractualDueDate,
+      paymentDate,
+      diffDays,
+      gracePeriodDays: GRACE_DAYS,
+    },
+    calculation: `${remainingPrincipal} × (${r} / 365) × ${diffDays} = ${result}`,
+    result,
+  });
+
+  return result;
+}
+
+// ─── Compute indexation balance ──────────────────────────────────────────────
+
+function computeIndexationBalance(
+  remainingPrincipal: number,
+  currentIndex: number,
+  baseIndex: number
+): number {
+  if (remainingPrincipal <= 0 || baseIndex <= 0) {
+    logger.info('Indexation calculation skipped', {
+      reason: remainingPrincipal <= 0 ? 'remaining principal <= 0' : 'base index <= 0',
+      remainingPrincipal,
+      baseIndex,
+    });
+    return 0;
+  }
+  const ratio = currentIndex / baseIndex;
+  const indexation = remainingPrincipal * (ratio - 1);
+  const result = round(indexation);
+
+  logger.info('Indexation calculation', {
+    formula: 'Indexation = Remaining_Principal × (Current_Index / Base_Index - 1)',
+    values: {
+      remainingPrincipal,
+      currentIndex,
+      baseIndex,
+      ratio: `${currentIndex} / ${baseIndex} = ${ratio.toFixed(4)}`,
+    },
+    calculation: `${remainingPrincipal} × (${ratio.toFixed(4)} - 1) = ${remainingPrincipal} × ${(ratio - 1).toFixed(4)} = ${result}`,
+    result,
+  });
+
+  return result;
+}
+
+// ─── Compute balances before payment ─────────────────────────────────────────
+
+export async function computeBalancesBeforePayment(
+  parentItemId: string,
+  contractualItem: ContractualPaymentItem,
+  paymentDate: string,
+  contractDetails: ContractDetails | null,
+  currentIndex: number
+): Promise<{ balances: BalancesBeforePayment; remaining: RemainingBalances }> {
+  const previous = await getPreviousSubitemBalances(parentItemId, contractualItem.principal);
+
+  const remainingPrincipalBefore = previous.remainingPrincipal;
+  const interestRatePercent = contractDetails?.interestRatePercent ?? 0;
+  const baseIndex = contractDetails?.baseIndex ?? 100;
+
+  const calculatedInterest = computeLateInterest(
+    remainingPrincipalBefore,
+    interestRatePercent,
+    contractualItem.contractualDueDate,
+    paymentDate
+  );
+  const remainingInterestBefore = round(calculatedInterest + previous.remainingInterest);
+
+  const calculatedIndexation = computeIndexationBalance(
+    remainingPrincipalBefore,
+    currentIndex,
+    baseIndex
+  );
+  const remainingIndexationBefore = round(calculatedIndexation + previous.remainingIndexation);
+
+  const balances: BalancesBeforePayment = {
+    remainingPrincipalBefore,
+    remainingInterestBefore,
+    remainingIndexationBefore,
+  };
+
+  const remaining: RemainingBalances = {
+    principal: remainingPrincipalBefore,
+    interest: remainingInterestBefore,
+    indexation: remainingIndexationBefore,
+  };
+
+  logger.info('Balances before payment (combined)', {
+    parentItemId,
+    paymentDate,
+    fromPreviousSubitem: {
+      remainingPrincipal: previous.remainingPrincipal,
+      remainingInterest: previous.remainingInterest,
+      remainingIndexation: previous.remainingIndexation,
+    },
+    interestFormula: 'Remaining_Interest_Before = calculated_interest + previous_remaining_interest',
+    interestValues: {
+      calculatedInterest,
+      previousRemainingInterest: previous.remainingInterest,
+      remainingInterestBefore,
+    },
+    indexationFormula: 'Remaining_Indexation_Before = calculated_indexation + previous_remaining_indexation',
+    indexationValues: {
+      calculatedIndexation,
+      previousRemainingIndexation: previous.remainingIndexation,
+      remainingIndexationBefore,
+    },
+    totals: {
+      remainingPrincipalBefore,
+      remainingInterestBefore,
+      remainingIndexationBefore,
+      totalOwed: round(remainingPrincipalBefore + remainingInterestBefore + remainingIndexationBefore),
+    },
+  });
+
+  return { balances, remaining };
+}
+
+// ─── Allocate payment amount by priority (interest → indexation → principal) ─
 
 export function allocatePayment(
   amount: number,
@@ -412,16 +749,58 @@ export function allocatePayment(
   let remaining = round(amount);
   const { principal, interest, indexation } = initialBalances;
 
-  let indexationPaid = round(Math.min(remaining, indexation));
-  remaining = round(remaining - indexationPaid);
+  const allocationOrder = '1. Interest → 2. Indexation → 3. Principal';
 
   let interestPaid = round(Math.min(remaining, interest));
-  remaining = round(remaining - interestPaid);
+  const afterInterest = round(remaining - interestPaid);
+  remaining = afterInterest;
+
+  let indexationPaid = round(Math.min(remaining, indexation));
+  const afterIndexation = round(remaining - indexationPaid);
+  remaining = afterIndexation;
 
   let principalPaid = round(Math.min(remaining, principal));
-  remaining = round(remaining - principalPaid);
+  const afterPrincipal = round(remaining - principalPaid);
+  remaining = afterPrincipal;
 
-  const amountUsed = round(indexationPaid + interestPaid + principalPaid);
+  const amountUsed = round(interestPaid + indexationPaid + principalPaid);
+
+  logger.info('Payment allocation', {
+    formula: allocationOrder,
+    input: {
+      paymentAmount: amount,
+      balancesOwed: { interest, indexation, principal },
+    },
+    step1_interest: {
+      remainingBefore: amount,
+      interestOwed: interest,
+      interestPaid,
+      remainingAfter: afterInterest,
+    },
+    step2_indexation: {
+      remainingBefore: afterInterest,
+      indexationOwed: indexation,
+      indexationPaid,
+      remainingAfter: afterIndexation,
+    },
+    step3_principal: {
+      remainingBefore: afterIndexation,
+      principalOwed: principal,
+      principalPaid,
+      remainingAfter: afterPrincipal,
+    },
+    result: {
+      indexationPaid,
+      interestPaid,
+      principalPaid,
+      amountUsed,
+      remainingBalances: {
+        indexation: round(indexation - indexationPaid),
+        interest: round(interest - interestPaid),
+        principal: round(principal - principalPaid),
+      },
+    },
+  });
 
   return {
     principalPaid,
@@ -439,21 +818,24 @@ export function allocatePayment(
 export function createSubitemPayload(
   paymentDate: string,
   allocation: AllocationResult,
-  actualAmountAllocated: number
+  actualAmountAllocated: number,
+  balancesBefore: BalancesBeforePayment
 ): SubitemPayload {
   const sub = CONTRACTUAL_PAYMENTS.subitems;
   // Monday API expects numeric columns as plain strings: "column_id": "123"
-  // Name is set via item_name; only set numeric columns in column_values
   const columnValues: Record<string, string> = {
     [sub.actualReceipt]: String(actualAmountAllocated),
+    [sub.remainingPrincipalBeforePayment]: String(balancesBefore.remainingPrincipalBefore),
+    [sub.remainingInterestBeforePayment]: String(balancesBefore.remainingInterestBefore),
+    [sub.remainingIndexationBeforePayment]: String(balancesBefore.remainingIndexationBefore),
     [sub.interest]: String(allocation.interestPaid),
     [sub.indexLinkage]: String(allocation.indexationPaid),
-    [sub.remainingPrincipal]: String(allocation.remainingPrincipal),
     [sub.remainingInterest]: String(allocation.remainingInterest),
     [sub.remainingIndexLinkage]: String(allocation.remainingIndexation),
+    [sub.remainingPrincipal]: String(allocation.remainingPrincipal),
   };
   return {
-    name: paymentDate,
+    name: formatDateForDisplay(paymentDate),
     columnValues,
   };
 }
@@ -464,8 +846,6 @@ export async function createSubitem(
   parentItemId: string,
   payload: SubitemPayload
 ): Promise<string> {
-  logger.info('Creating subitem under parent', { parentItemId, name: payload.name });
-
   const columnValuesJson = JSON.stringify(payload.columnValues);
 
   const mutation = `
@@ -491,7 +871,6 @@ export async function createSubitem(
     throw new Error('Failed to create subitem: no ID returned');
   }
 
-  logger.info('Subitem created', { parentItemId, subitemId: id });
   return id;
 }
 
@@ -534,33 +913,45 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
     actualPayment.receiptDate ??
     new Date().toISOString().slice(0, 10);
 
+  const [contractDetails, indexResult] = await Promise.all([
+    fetchContractDetails(contractId),
+    fetchLatestIndexFromMonday(),
+  ]);
+
+  const currentIndex = indexResult?.value ?? 100;
+  if (!indexResult) {
+    logger.warn('No index from Monday board, using 100 for indexation');
+  }
+
   let remainingToAllocate = round(actualPayment.receiptAmount);
   let subitemsCreated = 0;
 
   for (const item of contractualItems) {
     if (remainingToAllocate <= 0) break;
 
-    const parentOriginal = {
-      principal: item.principal,
-      interest: item.interest,
-      indexation: item.indexation,
-    };
+    const { balances, remaining } = await computeBalancesBeforePayment(
+      item.id,
+      item,
+      paymentDate,
+      contractDetails,
+      currentIndex
+    );
 
-    const balances = await getRemainingBalances(item.id, parentOriginal);
-    const totalRemaining = round(balances.principal + balances.interest + balances.indexation);
+    const totalRemaining = round(remaining.principal + remaining.interest + remaining.indexation);
 
     if (totalRemaining <= 0) {
       logger.info('Contractual item fully paid, skipping', { itemId: item.id });
       continue;
     }
 
-    const allocation = allocatePayment(remainingToAllocate, balances);
+    const allocation = allocatePayment(remainingToAllocate, remaining);
     if (allocation.amountUsed <= 0) break;
 
     const payload = createSubitemPayload(
       paymentDate,
       allocation,
-      allocation.amountUsed
+      allocation.amountUsed,
+      balances
     );
 
     await createSubitem(item.id, payload);
