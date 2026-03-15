@@ -731,10 +731,19 @@ function computeIndexationBalance(
   }
   const ratio = currentIndex / previousIndex;
   const indexation = remainingPrincipal * (ratio - 1);
-  const result = round(indexation);
+  let result = round(indexation);
+
+  if (result < 0) {
+    logger.info('Indexation capped at 0 (Current_Index < Previous_Index)', {
+      rawIndexation: result,
+      currentIndex,
+      previousIndex,
+    });
+    result = 0;
+  }
 
   logger.info('Indexation calculation', {
-    formula: 'Indexation = Remaining_Principal × (Current_Index / Previous_Index - 1)',
+    formula: 'Indexation = Remaining_Principal × (Current_Index / Previous_Index - 1), min 0',
     values: {
       remainingPrincipal,
       currentIndex,
