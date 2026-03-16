@@ -11,6 +11,10 @@ import { logger } from '../logger';
 const CBS_BASE = process.env.CBS_API_BASE ?? 'https://api.cbs.gov.il';
 const USER_AGENT = 'PaymentsBoard/1.0 (https://github.com)';
 
+function roundTo2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
 export interface IndexRecord {
   period: string; // YYYY-MM
   value: number;
@@ -26,7 +30,9 @@ export interface FetchIndexResult {
   rawResponse?: string;
 }
 
-const CONSTRUCTION_INDEX_ID = 200010; // מדד מחירי תשומה בבנייה למגורים - כללי
+/** מדד מחירי תשומה בבנייה למגורים - כללי (CBS series 200010) */
+const CONSTRUCTION_INDEX_ID = 200010;
+const CONSTRUCTION_INDEX_NAME = 'מדד מחירי תשומה בבנייה למגורים - כללי';
 
 /** CBS index codes from catalog tree */
 export const CBS_INDEX_CODES = {
@@ -34,17 +40,18 @@ export const CBS_INDEX_CODES = {
   CONSUMER_PRICE: 120010, // מדד המחירים לצרכן - כללי
 } as const;
 
+/** Value must use base 2011 יולי (≈140.5), NOT base 2025 יולי (≈101.3). */
 const BASE_2011_JULY = '2011 יולי';
 
 /**
- * Fetch latest Construction Input Index from CBS (series 200010).
- * Uses index_base with base="2011 יולי" (not 2025 יולי).
+ * Fetch latest מדד מחירי תשומה בבנייה למגורים - כללי from CBS (series 200010).
+ * Returns value with base 2011 יולי.
  */
 export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
   const override = getOverride(CONSTRUCTION_INDEX_ID);
   if (override) {
-    logger.info('Using CBS index override', { indexName: 'Construction Input Price Index', override });
-    return { success: true, indexName: 'Construction Input Price Index', latest: override };
+    logger.info('Using CBS index override', { indexName: CONSTRUCTION_INDEX_NAME, override });
+    return { success: true, indexName: CONSTRUCTION_INDEX_NAME, latest: override };
   }
 
   try {
@@ -58,7 +65,7 @@ export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
     if (!Array.isArray(records) || records.length === 0) {
       return {
         success: false,
-        indexName: 'Construction Input Price Index',
+        indexName: CONSTRUCTION_INDEX_NAME,
         error: 'No records in CBS response',
       };
     }
@@ -67,14 +74,26 @@ export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
     if (!latest) {
       return {
         success: false,
-        indexName: 'Construction Input Price Index',
+        indexName: CONSTRUCTION_INDEX_NAME,
         error: 'No latest record',
       };
     }
 
-    const prevBase = latest.prevBase as Array<{ baseDesc?: string; value?: number }> | undefined;
-    const base2011 = prevBase?.find((b) => b.baseDesc === BASE_2011_JULY);
-    const value = base2011?.value ?? parseFloat(String(latest.value ?? 0));
+    // API returns multiple index_base; explicitly select base="2011 יולי" (value ≈140.5).
+    const indexBaseArr = (latest.index_base ?? latest.prevBase) as
+      | Array<{ base?: string; baseDesc?: string; value?: number }>
+      | undefined;
+    const base2011 = indexBaseArr?.find(
+      (b) => (b.base ?? b.baseDesc) === BASE_2011_JULY
+    );
+    if (!base2011 || typeof base2011.value !== 'number') {
+      return {
+        success: false,
+        indexName: CONSTRUCTION_INDEX_NAME,
+        error: `index_base with base="${BASE_2011_JULY}" not found in CBS response`,
+      };
+    }
+    const value = base2011.value;
     const year = latest.year as number | undefined;
     const month = latest.month as number | undefined;
     const periodStr = String(latest.period ?? '');
@@ -88,25 +107,25 @@ export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
     if (isNaN(value) || (!period && (year == null || month == null))) {
       return {
         success: false,
-        indexName: 'Construction Input Price Index',
+        indexName: CONSTRUCTION_INDEX_NAME,
         error: 'Could not parse period or value from latest record',
       };
     }
 
     const indexRecord: IndexRecord = {
       period: period || `${String(month ?? 0).padStart(2, '0')}-${year ?? 0}`,
-      value,
+      value: roundTo2(value),
       month: month ?? 0,
       year: year ?? 0,
     };
 
     logger.info('Construction Input Index fetched', { latest: indexRecord });
-    return { success: true, indexName: 'Construction Input Price Index', latest: indexRecord };
+    return { success: true, indexName: CONSTRUCTION_INDEX_NAME, latest: indexRecord };
   } catch (err) {
     logger.warn('Construction Input fetch failed', { err });
     return {
       success: false,
-      indexName: 'Construction Input Price Index',
+      indexName: CONSTRUCTION_INDEX_NAME,
       error: err instanceof Error ? err.message : 'Fetch failed',
     };
   }
@@ -114,22 +133,31 @@ export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
 
 /**
  * Extract from CBS price API format: { month: [{ date: [{ year, month, currBase: { value } }] }] }
+ * Returns the index value for the latest month (sorts by period descending).
  */
 function extractFromCbsPriceFormat(data: Record<string, unknown>): IndexRecord | null {
   const monthArr = data.month as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(monthArr) || monthArr.length === 0) return null;
   const dates = monthArr[0]?.date as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(dates) || dates.length === 0) return null;
-  const currBase = dates[0]?.currBase as { value?: number } | undefined;
-  const year = dates[0]?.year as number | undefined;
-  const month = dates[0]?.month as number | undefined;
-  if (currBase?.value == null || !year || !month) return null;
-  return {
-    period: `${String(month).padStart(2, '0')}-${year}`,
-    value: currBase.value,
-    month,
-    year,
-  };
+
+  const records: IndexRecord[] = [];
+  for (const d of dates) {
+    const currBase = d?.currBase as { value?: number } | undefined;
+    const year = d?.year as number | undefined;
+    const month = d?.month as number | undefined;
+    if (currBase?.value != null && year != null && month != null) {
+      records.push({
+        period: `${String(month).padStart(2, '0')}-${year}`,
+        value: roundTo2(currBase.value),
+        month,
+        year,
+      });
+    }
+  }
+  if (records.length === 0) return null;
+  records.sort((a, b) => b.period.localeCompare(a.period));
+  return records[0];
 }
 
 /**
@@ -181,7 +209,7 @@ export function extractLatestIndex(
   const [year, month] = latest.period.split('-').map(Number);
   return {
     period: latest.period,
-    value: latest.value,
+    value: roundTo2(latest.value),
     month,
     year,
   };
@@ -204,7 +232,7 @@ function parsePeriodAndValue(time: unknown, value: unknown): IndexRecord | null 
   if (year && month && !isNaN(val)) {
     return {
       period: `${String(month).padStart(2, '0')}-${year}`,
-      value: val,
+      value: roundTo2(val),
       month,
       year,
     };
@@ -214,7 +242,7 @@ function parsePeriodAndValue(time: unknown, value: unknown): IndexRecord | null 
 
 /**
  * Check for override from env (for testing when CBS API is unavailable).
- * CBS_INDEX_OVERRIDE='{"120010":{"period":"01-2026","value":106},"200010":{"period":"01-2026","value":140.5}}'
+ * CBS_INDEX_OVERRIDE='{"120010":{"period":"01-2026","value":106},"200010":{"period":"01-2026","value":140.5031}}'
  */
 function getOverride(codeId: number): IndexRecord | null {
   const raw = process.env.CBS_INDEX_OVERRIDE;
@@ -225,7 +253,7 @@ function getOverride(codeId: number): IndexRecord | null {
     const v = obj[key];
     if (v?.period && typeof v.value === 'number') {
       const [mm, yyyy] = v.period.split('-').map(Number);
-      return { period: v.period, value: v.value, month: mm, year: yyyy };
+      return { period: v.period, value: roundTo2(v.value), month: mm, year: yyyy };
     }
   } catch {
     /* ignore */

@@ -104,6 +104,7 @@ async function getIndexHandler(req: Request, res: Response) {
   try {
     logger.info('get-index: fetching CBS indices');
 
+    // CBS series 200010 (מדד מחירי תשומה בבנייה למגורים), 120010 (Consumer Price)
     const [constructionResult, consumerResult] = await Promise.all([
       getLatestConstructionIndex(),
       fetchCbsIndex(CBS_INDEX_CODES.CONSUMER_PRICE, 'Consumer Price Index'),

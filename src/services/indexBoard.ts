@@ -25,7 +25,7 @@ export async function createIndexItem(
   const col = INDEX_BOARD.columns;
 
   const columnValues: Record<string, string | Record<string, string>> = {
-    [col.indexValue]: String(record.value),
+    [col.indexValue]: Number(record.value).toFixed(2),
     [col.updateDate]: { date: updateDate },
   };
 
