@@ -48,12 +48,6 @@ const BASE_2011_JULY = '2011 יולי';
  * Returns value with base 2011 יולי.
  */
 export async function getLatestConstructionIndex(): Promise<FetchIndexResult> {
-  const override = getOverride(CONSTRUCTION_INDEX_ID);
-  if (override) {
-    logger.info('Using CBS index override', { indexName: CONSTRUCTION_INDEX_NAME, override });
-    return { success: true, indexName: CONSTRUCTION_INDEX_NAME, latest: override };
-  }
-
   try {
     const res = await fetch(
       `${CBS_BASE}/index/data/price?id=${CONSTRUCTION_INDEX_ID}&format=json&download=false&last=6&coef=true`,
@@ -156,7 +150,7 @@ function extractFromCbsPriceFormat(data: Record<string, unknown>): IndexRecord |
     }
   }
   if (records.length === 0) return null;
-  records.sort((a, b) => b.period.localeCompare(a.period));
+  records.sort((a, b) => (b.year !== a.year ? b.year - a.year : b.month - a.month));
   return records[0];
 }
 
@@ -204,7 +198,11 @@ export function extractLatestIndex(
   }
 
   if (records.length === 0) return null;
-  records.sort((a, b) => b.period.localeCompare(a.period));
+  records.sort((a, b) => {
+    const [aM, aY] = a.period.split('-').map(Number);
+    const [bM, bY] = b.period.split('-').map(Number);
+    return bY !== aY ? bY - aY : bM - aM;
+  });
   const latest = records[0];
   const [year, month] = latest.period.split('-').map(Number);
   return {
@@ -241,27 +239,6 @@ function parsePeriodAndValue(time: unknown, value: unknown): IndexRecord | null 
 }
 
 /**
- * Check for override from env (for testing when CBS API is unavailable).
- * CBS_INDEX_OVERRIDE='{"120010":{"period":"01-2026","value":106},"200010":{"period":"01-2026","value":140.5031}}'
- */
-function getOverride(codeId: number): IndexRecord | null {
-  const raw = process.env.CBS_INDEX_OVERRIDE;
-  if (!raw) return null;
-  try {
-    const obj = JSON.parse(raw) as Record<string, { period?: string; value?: number }>;
-    const key = String(codeId);
-    const v = obj[key];
-    if (v?.period && typeof v.value === 'number') {
-      const [mm, yyyy] = v.period.split('-').map(Number);
-      return { period: v.period, value: roundTo2(v.value), month: mm, year: yyyy };
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-/**
  * Fetch latest index value from CBS API.
  * Tries multiple URL patterns as CBS API structure may vary.
  */
@@ -269,12 +246,6 @@ export async function fetchCbsIndex(
   codeId: number,
   indexName: string
 ): Promise<FetchIndexResult> {
-  const override = getOverride(codeId);
-  if (override) {
-    logger.info('Using CBS index override', { indexName, override });
-    return { success: true, indexName, latest: override };
-  }
-
   const urls = [
     `${CBS_BASE}/index/data/price?id=${codeId}&format=json&download=false&last=6`,
     `${CBS_BASE}/index/data/${codeId}?format=json&download=false`,
@@ -327,5 +298,104 @@ export async function fetchCbsIndex(
     error: `Could not fetch latest ${indexName} from CBS API`,
     rawResponse: 'All URL patterns returned no valid data',
   };
+}
+
+/** Record for fill-construction-index: item name format "01-2020" (MM-YYYY), value base 2011 יולי */
+export interface ConstructionIndexHistoryRecord {
+  name: string; // MM-YYYY, e.g. "01-2020"
+  period: string; // MM-YYYY (same as name)
+  value: number;
+  month: number;
+  year: number;
+}
+
+const START_YEAR = 2020;
+const START_MONTH = 1;
+
+/**
+ * Fetch Construction Input Index history from CBS (series 200010, base 2011 יולי)
+ * from 01-2020 until today. Returns records in chronological order (oldest first).
+ */
+export async function fetchConstructionIndexHistory(): Promise<{
+  success: boolean;
+  records?: ConstructionIndexHistoryRecord[];
+  error?: string;
+}> {
+  try {
+    const allDates: Array<{
+      year: number;
+      month: number;
+      monthDesc: string;
+      value: number;
+    }> = [];
+    const seen = new Set<string>();
+    let page = 1;
+    const pageSize = 100;
+    let hasMore = true;
+
+    while (hasMore) {
+      const url = `${CBS_BASE}/index/data/price?id=${CONSTRUCTION_INDEX_ID}&format=json&download=false&coef=true&Page=${page}&PageSize=${pageSize}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = (await res.json()) as Record<string, unknown>;
+
+      const monthArr = data.month as Array<Record<string, unknown>> | undefined;
+      const dates = Array.isArray(monthArr) && monthArr[0] ? (monthArr[0].date as Array<Record<string, unknown>>) : [];
+      if (!Array.isArray(dates) || dates.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      for (const d of dates) {
+        const year = d.year as number | undefined;
+        const month = d.month as number | undefined;
+        const monthDesc = String(d.monthDesc ?? '');
+        if (year == null || month == null || !monthDesc) continue;
+
+        if (year < START_YEAR || (year === START_YEAR && month < START_MONTH)) continue;
+
+        const prevBase = d.prevBase as Array<{ baseDesc?: string; value?: number }> | undefined;
+        const currBase = d.currBase as { baseDesc?: string; value?: number } | undefined;
+        const base2011 = prevBase?.find((b) => b.baseDesc === BASE_2011_JULY) ?? (currBase?.baseDesc === BASE_2011_JULY ? currBase : null);
+        const value = base2011?.value;
+        if (typeof value !== 'number') continue;
+
+        const key = `${year}-${month}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        allDates.push({ year, month, monthDesc, value: roundTo2(value) });
+      }
+
+      const paging = data.paging as { last_page?: number; current_page?: number } | undefined;
+      const lastPage = paging?.last_page ?? 1;
+      hasMore = page < lastPage;
+      page++;
+    }
+
+    const records: ConstructionIndexHistoryRecord[] = allDates
+      .filter((d) => d.year > START_YEAR || (d.year === START_YEAR && d.month >= START_MONTH))
+      .sort((a, b) => (a.year !== b.year ? a.year - b.year : a.month - b.month))
+      .map((d) => {
+        const period = `${String(d.month).padStart(2, '0')}-${d.year}`;
+        return {
+          name: period,
+          period,
+        value: d.value,
+        month: d.month,
+        year: d.year,
+      };
+      });
+
+    logger.info('Construction Index history fetched', { count: records.length, from: '01-2020' });
+    return { success: true, records };
+  } catch (err) {
+    logger.warn('Construction Index history fetch failed', { err });
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : 'Fetch failed',
+    };
+  }
 }
 

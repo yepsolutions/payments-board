@@ -419,10 +419,20 @@ function getIndexPeriodForPaymentDate(paymentDate: string): string {
   return targetPeriod;
 }
 
+/** Convert "MM-YYYY" to "YYYY-MM" for chronological comparison */
+function getPeriodSortKey(period: string): string {
+  const [mm, yyyy] = period.split('-');
+  return `${yyyy}-${mm}`;
+}
+
 // ─── Fetch index from Monday Indices board for payment date ──────────────────
 /**
+ * Used for both Current_Index and Previous_Index (when from previous subitem).
  * Item name format: "01-2026" (MM-YYYY).
- * Uses payment date to determine which index applies (published on 15th for previous month).
+ *
+ * Target period: previous month, or 2 months earlier if payment before 15th (index published on 15th).
+ * If target not yet published (e.g. payment on 16th, data not in yet), uses most recent available index.
+ * Always takes the most updated index we have for the date we are looking for.
  */
 export async function fetchIndexForPaymentDate(
   paymentDate: string
@@ -487,7 +497,25 @@ export async function fetchIndexForPaymentDate(
     })
     .filter((x): x is NonNullable<typeof x> => x != null && x.value > 0);
 
-  const match = withPeriod.find((x) => x.period === targetPeriod);
+  let match = withPeriod.find((x) => x.period === targetPeriod);
+
+  if (!match) {
+    // Target period not yet published - use most recent available index <= target (go back month by month)
+    const targetKey = getPeriodSortKey(targetPeriod);
+    const availableForTarget = withPeriod
+      .filter((x) => getPeriodSortKey(x.period) <= targetKey)
+      .sort((a, b) => getPeriodSortKey(b.period).localeCompare(getPeriodSortKey(a.period)));
+    match = availableForTarget[0];
+    if (match) {
+      logger.info('Index fallback: target period not yet published, using most recent available', {
+        paymentDate,
+        targetPeriod,
+        usedPeriod: match.period,
+        availablePeriods: withPeriod.map((x) => x.period),
+      });
+    }
+  }
+
   if (!match) {
     logger.warn('No index found for payment date', { paymentDate, targetPeriod, availablePeriods: withPeriod.map((x) => x.period) });
     return null;
@@ -496,6 +524,7 @@ export async function fetchIndexForPaymentDate(
   logger.info('Index fetched for payment date', {
     paymentDate,
     targetPeriod,
+    usedPeriod: match.period,
     currentIndex: match.value,
     source: `Indices board 5092654858, item "${match.period}"`,
   });

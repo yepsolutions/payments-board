@@ -4,7 +4,7 @@ import { logger } from '../logger';
 import { applyPayment } from '../services/paymentAllocation';
 import { ACTUAL_PAYMENTS } from '../config/config';
 import { fetchCbsIndex, getLatestConstructionIndex, CBS_INDEX_CODES } from '../services/cbsApi';
-import { createIndexItem } from '../services/indexBoard';
+import { createIndexItem, fillConstructionIndex } from '../services/indexBoard';
 import { INDEX_BOARD } from '../config/config';
 
 const router = Router();
@@ -87,6 +87,36 @@ async function applyPaymentHandler(req: Request, res: Response) {
   } catch (err) {
     logger.warn('Payment application error', { itemId, err });
     return res.status(500).json({
+      error: err instanceof Error ? err.message : 'Internal server error',
+    });
+  }
+}
+
+router.post('/fill-construction-index', fillConstructionIndexHandler);
+async function fillConstructionIndexHandler(req: Request, res: Response) {
+  if (req.body?.challenge) {
+    logger.info('fill-construction-index: webhook challenge received');
+    return res.status(200).json({ challenge: req.body.challenge });
+  }
+
+  try {
+    logger.info('fill-construction-index: starting');
+    const result = await fillConstructionIndex();
+    if (result.success) {
+      return res.status(200).json({
+        success: true,
+        created: result.created,
+        updated: result.updated,
+      });
+    }
+    return res.status(502).json({
+      success: false,
+      error: result.error,
+    });
+  } catch (err) {
+    logger.warn('fill-construction-index error', { err });
+    return res.status(500).json({
+      success: false,
       error: err instanceof Error ? err.message : 'Internal server error',
     });
   }
