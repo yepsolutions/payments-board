@@ -21,6 +21,7 @@ import {
 
 export interface ActualPaymentItem {
   id: string;
+  name: string;
   receiptAmount: number;
   receiptDate: string | null;
   linkedContractIds: number[];
@@ -111,6 +112,7 @@ export async function fetchActualPaymentItem(
     query GetActualPayment($itemId: ID!) {
       items(ids: [$itemId]) {
         id
+        name
         column_values(ids: ["${ACTUAL_PAYMENTS.columns.receiptAmount}", "${ACTUAL_PAYMENTS.columns.receiptDate}", "${ACTUAL_PAYMENTS.columns.contracts}", "${ACTUAL_PAYMENTS.columns.contractId}"]) {
           id
           value
@@ -124,7 +126,7 @@ export async function fetchActualPaymentItem(
   `;
 
   type ColumnValue = { id: string; value?: string | null; type: string; linked_item_ids?: string[] };
-  const data = await mondayQuery<{ items: Array<{ id: string; column_values: ColumnValue[] }> }>(query, { itemId: parseInt(itemId, 10) });
+  const data = await mondayQuery<{ items: Array<{ id: string; name: string; column_values: ColumnValue[] }> }>(query, { itemId: parseInt(itemId, 10) });
 
   const item = data.items?.[0];
   if (!item) {
@@ -183,6 +185,7 @@ export async function fetchActualPaymentItem(
 
   return {
     id: item.id,
+    name: item.name ?? '',
     receiptAmount: round(receiptAmount),
     receiptDate,
     linkedContractIds,
@@ -856,11 +859,13 @@ export function createSubitemPayload(
   paymentDate: string,
   allocation: AllocationResult,
   actualAmountAllocated: number,
-  balancesBefore: BalancesBeforePayment
+  balancesBefore: BalancesBeforePayment,
+  actualPaymentName: string
 ): SubitemPayload {
   const sub = CONTRACTUAL_PAYMENTS.subitems;
   // Monday API expects numeric columns as plain strings: "column_id": "123"
   const columnValues: Record<string, string> = {
+    [sub.actualPaymentName]: actualPaymentName || '',
     [sub.actualReceipt]: String(actualAmountAllocated),
     [sub.remainingPrincipalBeforePayment]: String(balancesBefore.remainingPrincipalBefore),
     [sub.remainingInterestBeforePayment]: String(balancesBefore.remainingInterestBefore),
@@ -984,7 +989,8 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
       paymentDate,
       allocation,
       allocation.amountUsed,
-      balances
+      balances,
+      actualPayment.name
     );
 
     await createSubitem(item.id, payload);

@@ -15,6 +15,7 @@ export const CONTRACTUAL_PAYMENTS = {
   subitems: {
     boardId: "5092168551",
     name: "name",
+    actualPaymentName: "text_mm1jy3x7",
     actualReceipt: "numeric_mm1bp0ht",
     remainingInterestBeforePayment: "numeric_mm1fws8v",
     remainingIndexationBeforePayment: "numeric_mm1f31qx",
