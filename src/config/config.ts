@@ -9,12 +9,14 @@ export const CONTRACTUAL_PAYMENTS = {
     contractLink: "board_relation_mm0tcdy3",
     /** Contractual due date (e.g. display / sorting) */
     contractualDueDate: "date_mm0t3zcj",
-    /** When set, replaces contractual due for late-days / interest timing only (vs actual receipt date). */
-    lateDaysDueDate: "date_mm2bakbq",
     /** Index-linked status: "V" = index-linked, "X" = not index-linked (indexation always 0) */
     indexLinkedStatus: "color_mm11deyr",
+    /** Interest-charge status: "V" = late days/interest as usual, "X" = no interest charge for this item */
+    interestChargeStatus: "color_mm2chzyh",
     /** דירה | רישום זכויות — receipts only clear lines with the same category */
     paymentCategory: "color_mm2b2889",
+    /** קרן לפני מע"מ — principal balance for allocation (interest/indexation/principal); overrides legacy payment column when non-zero */
+    principalBeforeVat: "numeric_mm2bhrm1",
   } as const,
   subitems: {
     boardId: "5092168551",
@@ -24,9 +26,12 @@ export const CONTRACTUAL_PAYMENTS = {
     actualPaymentItemId: "text_mm1y3p6f",
     /** When one receipt spans multiple contractual payments, all related subitems get label "כן" */
     splitPaymentIndicator: "color_mm1y2mwy",
-    /** Full receipt from Actual Payments (numeric_mm0tyhpc); unchanged when the payment is split across subitems */
+    /** Original actual payment total (numeric_mm0tyhpc); not split across subitems */
     originalActualReceiptTotal: "numeric_mm1z9zy4",
+    /** Split pre-VAT payment allocated to this subitem (interest + indexation + principal) */
     actualReceipt: "numeric_mm1bp0ht",
+    /** Split payment after VAT for presentation only: actualReceipt × (1 + vatPercent) */
+    splitPaymentAfterVat: "numeric_mm2dhfrf",
     remainingInterestBeforePayment: "numeric_mm1fws8v",
     remainingIndexationBeforePayment: "numeric_mm1f31qx",
     remainingPrincipalBeforePayment: "numeric_mm1fx9bf",
@@ -48,6 +53,10 @@ export const CONTRACTUAL_PAYMENTS = {
     indexationBaseIndex: "numeric_mm2b58jt",
     /** Same category as source actual payment (דירה | רישום זכויות) */
     paymentCategory: "color_mm2br0yj",
+    /** % מע"מ — copied from Actual Payments (numeric_mm2bnnc8) */
+    vatPercent: "numeric_mm2bkbnx",
+    /** יתרת תשלום אחרי מע"מ — (interest + indexation + principal paid this line) × (1 + VAT) */
+    remainingPaymentAfterVat: "numeric_mm2b5r02",
   } as const,
 } as const;
 
@@ -81,8 +90,12 @@ export const ACTUAL_PAYMENTS = {
     amountForInterest: "numeric_mm1421wt",
     amountForIndexLinkage: "numeric_mm14ep9e",
     amountForPrincipal: "numeric_mm14bdn5",
+    /** Actual payment amount before VAT — copied to subitems actual payment column (numeric_mm1bp0ht) */
+    receiptAmountBeforeVat: "numeric_mm2bfks3",
     /** דירה | רישום זכויות — which contractual stream this receipt pays */
     paymentCategory: "color_mm2b4z50",
+    /** % מע"מ — VAT rate; mirrored on contractual subitems (numeric_mm2bkbnx) */
+    vatPercent: "numeric_mm2bnnc8",
   } as const,
 } as const;
 

@@ -7,9 +7,9 @@
  * interest or indexation. Negative principal = discount / credit; positive receipts can absorb credit.
  *
  * Interest and indexation (apartment only) are calculated per payment from:
- * - Interest: Remaining_Principal × (r/365) × Late_Days + previous remaining interest
- * - Indexation: Remaining_Principal × (Current_Index/Previous_Index - 1) + previous remaining indexation
- *   (Previous_Index = contract base for first subitem, index from previous subitem's payment date for rest)
+ * - Interest: Payment_Base_Amount × (r/365) × Late_Days + previous remaining interest
+ * - Indexation: Payment_Base_Amount × (Current_Index/Base_Index - 1) + previous remaining indexation
+ *   (Base_Index is always the contract base index; it does not roll forward between subitems)
  */
 
 import { mondayQuery } from './mondayApi';
@@ -30,6 +30,8 @@ export interface ActualPaymentItem {
   id: string;
   name: string;
   receiptAmount: number;
+  /** Pre-VAT actual payment from source item (`numeric_mm2bfks3`); used for subitems.actualReceipt. */
+  receiptAmountBeforeVat: number;
   receiptDate: string | null;
   /**
    * Optional `date_mm2bcmy6`. When set, used instead of receiptDate for index lookup,
@@ -39,6 +41,8 @@ export interface ActualPaymentItem {
   linkedContractIds: number[];
   /** From actual payment board status; defaults to דירה when unset. */
   paymentCategory: PaymentCategory;
+  /** % מע"מ from actual payment board (`numeric_mm2bnnc8`); 0 when unset. */
+  vatPercent: number;
 }
 
 export interface ContractualPaymentItem {
@@ -50,10 +54,10 @@ export interface ContractualPaymentItem {
   indexationPaymentDue: number;
   principal: number;
   contractualDueDate: string | null;
-  /** `date_mm2bakbq` — if set, used instead of contractualDueDate for late-days only. */
-  lateDaysDueDate: string | null;
   /** "V" = index-linked, "X" = not index-linked (indexation always 0). Default "V" when unset. */
   indexLinkedStatus: "V" | "X";
+  /** "V" = late-days/interest as usual, "X" = no late-days/interest on this item. */
+  interestChargeStatus: "V" | "X";
   /** דירה | רישום זכויות — must match actual payment to allocate. */
   paymentCategory: PaymentCategory;
 }
@@ -99,6 +103,17 @@ const ROUND = 2;
 
 function round(value: number): number {
   return Math.round(value * 10 ** ROUND) / 10 ** ROUND;
+}
+
+/**
+ * Gross = net × (1 + rate). Board may store VAT as a fraction (0.18) or as percent (18).
+ * Matches spreadsheet-style *(1+numeric_mm2bkbnx) whether the cell is 0.18 or 18.
+ */
+function vatGrossMultiplier(vatRate: number): number {
+  const v = Number.isFinite(vatRate) ? vatRate : 0;
+  if (v === 0) return 1;
+  if (Math.abs(v) < 1) return 1 + v;
+  return 1 + v / 100;
 }
 
 /** Format date for subitem name: "Mar 1, 2026" */
@@ -184,7 +199,7 @@ export async function fetchActualPaymentItem(
       items(ids: [$itemId]) {
         id
         name
-        column_values(ids: ["${ACTUAL_PAYMENTS.columns.receiptAmount}", "${ACTUAL_PAYMENTS.columns.receiptDate}", "${ACTUAL_PAYMENTS.columns.indexPaymentDate}", "${ACTUAL_PAYMENTS.columns.contracts}", "${ACTUAL_PAYMENTS.columns.contractId}", "${ACTUAL_PAYMENTS.columns.paymentCategory}"]) {
+        column_values(ids: ["${ACTUAL_PAYMENTS.columns.receiptAmount}", "${ACTUAL_PAYMENTS.columns.receiptAmountBeforeVat}", "${ACTUAL_PAYMENTS.columns.receiptDate}", "${ACTUAL_PAYMENTS.columns.indexPaymentDate}", "${ACTUAL_PAYMENTS.columns.contracts}", "${ACTUAL_PAYMENTS.columns.contractId}", "${ACTUAL_PAYMENTS.columns.paymentCategory}", "${ACTUAL_PAYMENTS.columns.vatPercent}"]) {
           id
           value
           type
@@ -215,11 +230,13 @@ export async function fetchActualPaymentItem(
   }
 
   let receiptAmount = 0;
+  let receiptAmountBeforeVat = 0;
   let receiptDate: string | null = null;
   let indexPaymentDate: string | null = null;
   let linkedContractIds: number[] = [];
   let contractIdText: string | null = null;
   let paymentCategory: PaymentCategory = 'דירה';
+  let vatPercent = 0;
 
   for (const cv of item.column_values) {
     if (cv.id === ACTUAL_PAYMENTS.columns.receiptAmount) {
@@ -228,6 +245,13 @@ export async function fetchActualPaymentItem(
         receiptAmount = parseFloat(parsed.value ?? parsed) || 0;
       } catch {
         receiptAmount = parseFloat(cv.value ?? '') || 0;
+      }
+    } else if (cv.id === ACTUAL_PAYMENTS.columns.receiptAmountBeforeVat) {
+      try {
+        const parsed = JSON.parse(cv.value || '{}');
+        receiptAmountBeforeVat = parseFloat(parsed.value ?? parsed) || 0;
+      } catch {
+        receiptAmountBeforeVat = parseFloat(cv.value ?? '') || 0;
       }
     } else if (cv.id === ACTUAL_PAYMENTS.columns.receiptDate) {
       try {
@@ -261,6 +285,13 @@ export async function fetchActualPaymentItem(
       if (contractIdText && typeof contractIdText !== 'string') contractIdText = String(contractIdText);
     } else if (cv.id === ACTUAL_PAYMENTS.columns.paymentCategory) {
       paymentCategory = parsePaymentCategoryLabel(cv);
+    } else if (cv.id === ACTUAL_PAYMENTS.columns.vatPercent) {
+      try {
+        const parsed = JSON.parse(cv.value || '{}');
+        vatPercent = parseFloat(parsed.value ?? parsed) || 0;
+      } catch {
+        vatPercent = parseFloat(cv.value ?? '') || 0;
+      }
     }
   }
 
@@ -278,10 +309,12 @@ export async function fetchActualPaymentItem(
     id: item.id,
     name: item.name ?? '',
     receiptAmount: round(receiptAmount),
+    receiptAmountBeforeVat: round(receiptAmountBeforeVat || receiptAmount),
     receiptDate,
     indexPaymentDate,
     linkedContractIds,
     paymentCategory,
+    vatPercent: round(vatPercent),
   };
 }
 
@@ -313,9 +346,10 @@ export async function findMatchingContractualItems(
     CONTRACTUAL_PAYMENTS.items.principalDue,
     CONTRACTUAL_PAYMENTS.items.indexationPaymentDue,
     CONTRACTUAL_PAYMENTS.items.contractualDueDate,
-    CONTRACTUAL_PAYMENTS.items.lateDaysDueDate,
     CONTRACTUAL_PAYMENTS.items.indexLinkedStatus,
+    CONTRACTUAL_PAYMENTS.items.interestChargeStatus,
     CONTRACTUAL_PAYMENTS.items.paymentCategory,
+    CONTRACTUAL_PAYMENTS.items.principalBeforeVat,
   ].join('", "');
 
   do {
@@ -425,10 +459,11 @@ export async function findMatchingContractualItems(
   const contractual: ContractualPaymentItem[] = items.map((item) => {
     let paymentDue = 0;
     let principalDue = 0;
+    let principalBeforeVat = 0;
     let indexationPaymentDue = 0;
     let contractualDueDate: string | null = null;
-    let lateDaysDueDate: string | null = null;
     let indexLinkedStatus: "V" | "X" = "V";
+    let interestChargeStatus: "V" | "X" = "V";
     let rowPaymentCategory: PaymentCategory = 'דירה';
 
     for (const cv of item.column_values) {
@@ -436,43 +471,50 @@ export async function findMatchingContractualItems(
         const parsed = JSON.parse(cv.value || '{}');
         if (cv.id === CONTRACTUAL_PAYMENTS.items.contractualDueDate) {
           contractualDueDate = parsed.date ?? null;
-        } else if (cv.id === CONTRACTUAL_PAYMENTS.items.lateDaysDueDate) {
-          lateDaysDueDate = parsed.date ? String(parsed.date).slice(0, 10) : null;
         } else if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentCategory) {
           rowPaymentCategory = parsePaymentCategoryLabel(cv as ContractualColumnValue);
         } else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexLinkedStatus) {
           const labelRaw = (cv as ContractualColumnValue).label ?? (cv as ContractualColumnValue).text ?? parsed.label ?? parsed.additional_info?.label;
           const label = (labelRaw ?? "").toString().trim().toUpperCase();
           indexLinkedStatus = label === "X" ? "X" : "V";
+        } else if (cv.id === CONTRACTUAL_PAYMENTS.items.interestChargeStatus) {
+          const labelRaw = (cv as ContractualColumnValue).label ?? (cv as ContractualColumnValue).text ?? parsed.label ?? parsed.additional_info?.label;
+          const label = (labelRaw ?? "").toString().trim().toUpperCase();
+          interestChargeStatus = label === "X" ? "X" : "V";
         } else {
           const val = parseFloat(parsed.value ?? parsed) || 0;
           if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
           else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalDue) principalDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalBeforeVat) principalBeforeVat = val;
           else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
         }
       } catch {
         if (cv.id === CONTRACTUAL_PAYMENTS.items.contractualDueDate) {
           contractualDueDate = cv.value ?? null;
-        } else if (cv.id === CONTRACTUAL_PAYMENTS.items.lateDaysDueDate) {
-          lateDaysDueDate =
-            typeof cv.value === 'string' && cv.value.trim() ? String(cv.value).slice(0, 10) : null;
         } else if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentCategory) {
           rowPaymentCategory = parsePaymentCategoryLabel(cv as ContractualColumnValue);
         } else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexLinkedStatus) {
           const labelRaw = (cv as ContractualColumnValue).label ?? (cv as ContractualColumnValue).text ?? cv.value;
           const label = (labelRaw ?? "").toString().trim().toUpperCase();
           indexLinkedStatus = label === "X" ? "X" : "V";
+        } else if (cv.id === CONTRACTUAL_PAYMENTS.items.interestChargeStatus) {
+          const labelRaw = (cv as ContractualColumnValue).label ?? (cv as ContractualColumnValue).text ?? cv.value;
+          const label = (labelRaw ?? "").toString().trim().toUpperCase();
+          interestChargeStatus = label === "X" ? "X" : "V";
         } else {
           const val = parseFloat(cv.value ?? '') || 0;
           if (cv.id === CONTRACTUAL_PAYMENTS.items.paymentDue) paymentDue = val;
           else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalDue) principalDue = val;
+          else if (cv.id === CONTRACTUAL_PAYMENTS.items.principalBeforeVat) principalBeforeVat = val;
           else if (cv.id === CONTRACTUAL_PAYMENTS.items.indexationPaymentDue) indexationPaymentDue = val;
         }
       }
     }
 
-    // Principal for first subitem — allow negative (discount / credit)
-    const principal = round(principalDue || paymentDue);
+    // Principal for first subitem — allow negative (discount / credit). Prefer קרן לפני מע"מ when non-zero; else legacy columns.
+    const principal = round(
+      principalBeforeVat !== 0 ? principalBeforeVat : principalDue || paymentDue
+    );
     const paymentOrder = parsePaymentOrder(item.name ?? '');
 
     return {
@@ -483,8 +525,8 @@ export async function findMatchingContractualItems(
       indexationPaymentDue,
       principal,
       contractualDueDate,
-      lateDaysDueDate,
       indexLinkedStatus,
+      interestChargeStatus,
       paymentCategory: rowPaymentCategory,
     };
   });
@@ -821,11 +863,11 @@ const GRACE_DAYS = 7;
 
 /** Calendar days from due date used in the interest formula (after grace); never negative. */
 function computeInterestLateDays(
-  remainingPrincipal: number,
+  interestBaseAmount: number,
   contractualDueDate: string | null,
   paymentDate: string
 ): number {
-  if (!contractualDueDate || remainingPrincipal <= 0) return 0;
+  if (!contractualDueDate || interestBaseAmount <= 0) return 0;
 
   const due = new Date(contractualDueDate);
   const paid = new Date(paymentDate);
@@ -838,27 +880,27 @@ function computeInterestLateDays(
 }
 
 function computeLateInterest(
-  remainingPrincipal: number,
+  interestBaseAmount: number,
   interestRatePercent: number,
   contractualDueDate: string | null,
   paymentDate: string,
   lateDaysOverride?: number
 ): number {
-  if (remainingPrincipal <= 0) return 0;
+  if (interestBaseAmount <= 0) return 0;
 
   const diffDays =
     lateDaysOverride !== undefined
       ? lateDaysOverride
-      : computeInterestLateDays(remainingPrincipal, contractualDueDate, paymentDate);
+      : computeInterestLateDays(interestBaseAmount, contractualDueDate, paymentDate);
   if (diffDays <= 0) return 0;
 
   const r = interestRatePercent / 100;
-  const interest = remainingPrincipal * (r / 365) * diffDays;
+  const interest = interestBaseAmount * (r / 365) * diffDays;
   const result = round(interest);
 
   logger.info('Interest', {
-    formula: 'Remaining_Principal × (r / 365) × Late_Days',
-    calculation: `${remainingPrincipal} × (${r} / 365) × ${diffDays} = ${result}`,
+    formula: 'Payment_Base_Amount × (r / 365) × Late_Days',
+    calculation: `${interestBaseAmount} × (${r} / 365) × ${diffDays} = ${result}`,
   });
 
   return result;
@@ -867,21 +909,21 @@ function computeLateInterest(
 // ─── Compute indexation balance ──────────────────────────────────────────────
 
 function computeIndexationBalance(
-  remainingPrincipal: number,
+  indexationBaseAmount: number,
   currentIndex: number,
   previousIndex: number
 ): number {
-  if (remainingPrincipal <= 0 || previousIndex <= 0) return 0;
+  if (indexationBaseAmount <= 0 || previousIndex <= 0) return 0;
 
   const ratio = currentIndex / previousIndex;
-  const indexation = remainingPrincipal * (ratio - 1);
+  const indexation = indexationBaseAmount * (ratio - 1);
   let result = round(indexation);
 
   if (result < 0) result = 0;
 
   logger.info('Indexation', {
     ratio: `${currentIndex} / ${previousIndex} = ${ratio.toFixed(4)}`,
-    calculation: `${remainingPrincipal} × (${ratio.toFixed(4)} - 1) = ${remainingPrincipal} × ${(ratio - 1).toFixed(4)} = ${result}`,
+    calculation: `${indexationBaseAmount} × (${ratio.toFixed(4)} - 1) = ${indexationBaseAmount} × ${(ratio - 1).toFixed(4)} = ${result}`,
   });
 
   return result;
@@ -896,6 +938,8 @@ export async function computeBalancesBeforePayment(
   paymentDate: string,
   /** Actual receipt date (`date_mm0tny6b`) for late-days vs contractual due — not the index override. */
   receiptDateForLateDays: string,
+  /** Amount available to allocate to this contractual item (pre-VAT). Used as base for interest+indexation. */
+  actualPaymentAmountForThisItem: number,
   contractDetails: ContractDetails | null,
   currentIndex: number,
   currentIndexPeriod: string
@@ -930,40 +974,35 @@ export async function computeBalancesBeforePayment(
   const interestRatePercent = contractDetails?.interestRatePercent ?? 0;
   const contractBaseIndex = contractDetails?.baseIndex ?? 100;
 
-  let previousIndex: number;
-  let baseIndexPeriod: string | null = null;
-  if (!previous.previousSubitemPaymentDate) {
-    previousIndex = contractBaseIndex;
-    baseIndexPeriod = contractDetails?.baseIndexPeriod ?? null;
-  } else {
-    const prevDateIso = parseSubitemNameToIsoDate(previous.previousSubitemPaymentDate);
-    const prevIndexResult = prevDateIso ? await fetchIndexForPaymentDate(prevDateIso) : null;
-    previousIndex = prevIndexResult?.value ?? contractBaseIndex;
-    baseIndexPeriod = prevIndexResult?.period ?? null;
-    if (!prevIndexResult && prevDateIso) {
-      logger.warn('Could not fetch index for previous subitem date, falling back to contract base index', {
-        previousSubitemPaymentDate: previous.previousSubitemPaymentDate,
-        contractBaseIndex,
-      });
-    }
-  }
+  const previousIndex = contractBaseIndex;
+  const baseIndexPeriod: string | null = contractDetails?.baseIndexPeriod ?? null;
 
-  const dueForLateDays =
-    contractualItem.lateDaysDueDate?.trim() || contractualItem.contractualDueDate;
-
-  const interestLateDays = computeInterestLateDays(
-    remainingPrincipalBefore,
-    dueForLateDays,
-    receiptDateForLateDays
+  const paymentBaseAmount = round(
+    Math.min(
+      Math.max(actualPaymentAmountForThisItem, 0),
+      Math.max(remainingPrincipalBefore, 0)
+    )
   );
 
-  const calculatedInterest = computeLateInterest(
-    remainingPrincipalBefore,
-    interestRatePercent,
-    dueForLateDays,
-    receiptDateForLateDays,
-    interestLateDays
-  );
+  const dueForLateDays = contractualItem.contractualDueDate;
+
+  const interestLateDays = contractualItem.interestChargeStatus === "X"
+    ? 0
+    : computeInterestLateDays(
+      paymentBaseAmount,
+      dueForLateDays,
+      receiptDateForLateDays
+    );
+
+  const calculatedInterest = contractualItem.interestChargeStatus === "X"
+    ? 0
+    : computeLateInterest(
+      paymentBaseAmount,
+      interestRatePercent,
+      dueForLateDays,
+      receiptDateForLateDays,
+      interestLateDays
+    );
   const remainingInterestBefore = round(calculatedInterest + previous.remainingInterest);
 
   let calculatedIndexation = 0;
@@ -987,7 +1026,7 @@ export async function computeBalancesBeforePayment(
     // indexation skipped
   } else {
     calculatedIndexation = computeIndexationBalance(
-      remainingPrincipalBefore,
+      paymentBaseAmount,
       currentIndex,
       previousIndex
     );
@@ -1076,23 +1115,30 @@ export function allocatePayment(
 export function createSubitemPayload(
   paymentDate: string,
   allocation: AllocationResult,
-  actualAmountAllocated: number,
   balancesBefore: BalancesBeforePayment,
   actualPaymentName: string,
   actualPaymentItemId: string,
   /** Same as actual payment board receipt (numeric_mm0tyhpc); repeated on each subitem when split */
   originalActualReceiptTotal: number,
   isPartOfSplitPayment: boolean,
-  paymentCategory: PaymentCategory
+  paymentCategory: PaymentCategory,
+  /** % מע"מ from actual payment — copied to subitem and used for יתרת תשלום אחרי מע"מ */
+  vatPercent: number
 ): SubitemPayload {
   const sub = CONTRACTUAL_PAYMENTS.subitems;
+  /** Pre-VAT amounts actually allocated in this subitem (same as mm1bkqds + mm19panw + mm1srrt5). */
+  const paidThisLinePreVat =
+    allocation.interestPaid + allocation.indexationPaid + allocation.principalPaid;
+  const remainingPaymentAfterVat = round(paidThisLinePreVat * vatGrossMultiplier(vatPercent));
+  const splitPaymentAfterVat = round(paidThisLinePreVat * vatGrossMultiplier(vatPercent));
   // Monday API: numerics/text as plain strings; status/color needs a JSON object in the outer column_values (same pattern as date columns in indexBoard).
   const columnValues: Record<string, unknown> = {
     [sub.actualPaymentName]: actualPaymentName || '',
     [sub.actualPaymentItemId]: actualPaymentItemId || '',
     [sub.paymentCategory]: { label: paymentCategory },
     [sub.originalActualReceiptTotal]: String(round(originalActualReceiptTotal)),
-    [sub.actualReceipt]: String(actualAmountAllocated),
+    [sub.actualReceipt]: String(round(paidThisLinePreVat)),
+    [sub.splitPaymentAfterVat]: String(splitPaymentAfterVat),
     [sub.remainingPrincipalBeforePayment]: String(balancesBefore.remainingPrincipalBefore),
     [sub.remainingInterestBeforePayment]: String(balancesBefore.remainingInterestBefore),
     [sub.remainingIndexationBeforePayment]: String(balancesBefore.remainingIndexationBefore),
@@ -1106,6 +1152,8 @@ export function createSubitemPayload(
     [sub.remainingInterest]: String(allocation.remainingInterest),
     [sub.remainingIndexLinkage]: String(allocation.remainingIndexation),
     [sub.remainingPrincipal]: String(allocation.remainingPrincipal),
+    [sub.vatPercent]: String(round(vatPercent)),
+    [sub.remainingPaymentAfterVat]: String(remainingPaymentAfterVat),
   };
   if (isPartOfSplitPayment) {
     // Status index 1 = "כן" on this column; must be an object, not a stringified blob (create_subitem stringifies column_values once).
@@ -1170,8 +1218,8 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
     return { success: false, subitemsCreated: 0, error: 'Actual payment item not found' };
   }
 
-  if (!actualPayment.receiptAmount || actualPayment.receiptAmount <= 0) {
-    return { success: false, subitemsCreated: 0, error: 'Invalid or missing receipt amount' };
+  if (!actualPayment.receiptAmountBeforeVat || actualPayment.receiptAmountBeforeVat <= 0) {
+    return { success: false, subitemsCreated: 0, error: 'Invalid or missing pre-VAT receipt amount' };
   }
 
   const contractId = extractContractId(actualPayment);
@@ -1190,7 +1238,7 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
     actualPayment.receiptDate ||
     new Date().toISOString().slice(0, 10);
 
-  /** Late days: contractual `date_mm2bakbq` or `date_mm0t3zcj` vs actual `date_mm0tny6b` only (not index override). */
+  /** Late days: always contractual `date_mm0t3zcj` vs actual `date_mm0tny6b` only (not index override). */
   const receiptDateForLateDays =
     actualPayment.receiptDate?.trim() ||
     paymentDate;
@@ -1207,7 +1255,7 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
     logger.warn('No index from Monday board, using 100 for indexation');
   }
 
-  let remainingToAllocate = round(actualPayment.receiptAmount);
+  let remainingToAllocate = round(actualPayment.receiptAmountBeforeVat);
 
   type PendingSubitem = {
     parentItemId: string;
@@ -1225,6 +1273,7 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
       item,
       paymentDate,
       receiptDateForLateDays,
+      remainingToAllocate,
       contractDetails,
       currentIndex,
       indexResult?.period ?? 'N/A'
@@ -1255,13 +1304,13 @@ export async function applyPayment(input: ApplyPaymentInput): Promise<ApplyPayme
     const payload = createSubitemPayload(
       paymentDate,
       p.allocation,
-      p.allocation.amountUsed,
       p.balances,
       actualPayment.name,
       actualPayment.id,
       actualPayment.receiptAmount,
       paymentSplitAcrossMultiple,
-      actualPayment.paymentCategory
+      actualPayment.paymentCategory,
+      actualPayment.vatPercent
     );
 
     await createSubitem(p.parentItemId, payload);
