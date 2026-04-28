@@ -2,6 +2,10 @@ import { Router, Request, Response } from 'express';
 import { mondayWebhookAuth } from '../middleware/mondayAuth';
 import { logger } from '../logger';
 import { applyPayment } from '../services/paymentAllocation';
+import {
+  applySupplierPayment,
+  calculateSupplierPayment,
+} from '../services/supplierPaymentAllocation';
 import { ACTUAL_PAYMENTS } from '../config/config';
 import { fetchCbsIndex, getLatestConstructionIndex, CBS_INDEX_CODES } from '../services/cbsApi';
 import { createIndexItem, fillConstructionIndex } from '../services/indexBoard';
@@ -41,6 +45,10 @@ function getActualPaymentItemId(event: Record<string, unknown>): string | null {
 
 router.post('/apply-payment', mondayWebhookAuth, applyPaymentHandler);
 router.post('/apply-payment/', mondayWebhookAuth, applyPaymentHandler);
+router.post('/apply-supplier-payment', mondayWebhookAuth, applySupplierPaymentHandler);
+router.post('/apply-supplier-payment/', mondayWebhookAuth, applySupplierPaymentHandler);
+router.post('/calculate-supplier-payment', mondayWebhookAuth, calculateSupplierPaymentHandler);
+router.post('/calculate-supplier-payment/', mondayWebhookAuth, calculateSupplierPaymentHandler);
 async function applyPaymentHandler(req: Request, res: Response) {
   const body = req.body;
 
@@ -86,6 +94,112 @@ async function applyPaymentHandler(req: Request, res: Response) {
     return res.status(400).json({ error: result.error });
   } catch (err) {
     logger.warn('Payment application error', { itemId, err });
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : 'Internal server error',
+    });
+  }
+}
+
+async function applySupplierPaymentHandler(req: Request, res: Response) {
+  const body = req.body;
+
+  if (body.challenge) {
+    logger.info('Supplier webhook challenge received');
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  const event = body.event;
+  if (!event) {
+    logger.warn('Missing event in supplier webhook payload');
+    return res.status(400).send({ error: 'Missing event payload' });
+  }
+
+  const boardId = event.boardId ?? event.board_id;
+  if (boardId != null && String(boardId) !== '5092501259') {
+    logger.info('Webhook from non-Supplier-Payments board, ignoring', { boardId });
+    return res.status(200).json({ received: true, skipped: 'wrong_board' });
+  }
+
+  if (isDuplicateWebhook(event)) {
+    logger.info('Duplicate supplier webhook, skipping', { event });
+    return res.status(200).json({ received: true, skipped: 'duplicate' });
+  }
+
+  const itemId = getActualPaymentItemId(event);
+  if (!itemId) {
+    logger.warn('Supplier webhook event has no pulseId/itemId');
+    return res.status(400).send({ error: 'Missing item ID in webhook' });
+  }
+
+  logger.info('Applying supplier payment for item', { itemId });
+
+  try {
+    const result = await applySupplierPayment({ supplierPaymentItemId: itemId });
+    if (result.success) {
+      return res.status(200).json({
+        received: true,
+        subitemId: result.subitemId,
+        principalPayment: result.principalPayment,
+        indexedPayment: result.indexedPayment,
+      });
+    }
+    logger.warn('Supplier payment application failed', { itemId, error: result.error });
+    return res.status(400).json({ error: result.error });
+  } catch (err) {
+    logger.warn('Supplier payment application error', { itemId, err });
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : 'Internal server error',
+    });
+  }
+}
+
+async function calculateSupplierPaymentHandler(req: Request, res: Response) {
+  const body = req.body;
+
+  if (body.challenge) {
+    logger.info('Supplier calculation webhook challenge received');
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  const event = body.event;
+  if (!event) {
+    logger.warn('Missing event in supplier calculation webhook payload');
+    return res.status(400).send({ error: 'Missing event payload' });
+  }
+
+  const boardId = event.boardId ?? event.board_id;
+  if (boardId != null && String(boardId) !== '5092501259') {
+    logger.info('Webhook from non-Supplier-Payments board, ignoring', { boardId });
+    return res.status(200).json({ received: true, skipped: 'wrong_board' });
+  }
+
+  if (isDuplicateWebhook(event)) {
+    logger.info('Duplicate supplier calculation webhook, skipping', { event });
+    return res.status(200).json({ received: true, skipped: 'duplicate' });
+  }
+
+  const itemId = getActualPaymentItemId(event);
+  if (!itemId) {
+    logger.warn('Supplier calculation webhook event has no pulseId/itemId');
+    return res.status(400).send({ error: 'Missing item ID in webhook' });
+  }
+
+  logger.info('Calculating supplier payment for item', { itemId });
+
+  try {
+    const result = await calculateSupplierPayment({ supplierPaymentItemId: itemId });
+    if (result.success) {
+      return res.status(200).json({
+        received: true,
+        principalPayment: result.principalPayment,
+        indexedPayment: result.indexedPayment,
+        totalPayment: result.totalPayment,
+      });
+    }
+    logger.warn('Supplier payment calculation failed', { itemId, error: result.error });
+    return res.status(400).json({ error: result.error });
+  } catch (err) {
+    logger.warn('Supplier payment calculation error', { itemId, err });
     return res.status(500).json({
       error: err instanceof Error ? err.message : 'Internal server error',
     });

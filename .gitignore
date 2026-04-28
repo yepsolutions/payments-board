@@ -39,3 +39,4 @@ coverage/
 # Misc
 *.pem
 .cache/
+code.tar.gz
