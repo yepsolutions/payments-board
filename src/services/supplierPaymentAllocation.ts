@@ -754,19 +754,26 @@ export async function calculateSupplierPayment(
       return { success: false, error: 'Supplier payment item not found' };
     }
 
-    // Principal balance we want to close (numeric_mm2sqmg9).
-    // This route returns the amount to put into numeric_mm2krmyr such that
-    // applySupplierPayment (indexation based on numeric_mm2krmyr) will reduce
-    // numeric_mm2sqmg9 to ~0, using the same rounding rules.
-    if (supplierItem.remainingToPayIsEmpty) {
-      await updateSupplierCalculationStatus(supplierItem.id, 'כשל');
-      return { success: false, error: 'Missing principal balance (numeric_mm2sqmg9)' };
-    }
-
-    const principalToClose = round(supplierItem.remainingToPay);
+    // Principal balance we want to close:
+    // - Prefer numeric_mm2sqmg9 (remaining-to-pay) when it already exists
+    // - On first run (blank remaining-to-pay), fall back to formula_mm1t1c7q (contractual principal)
+    //
+    // This route returns the amount to put into numeric_mm2krmyr such that applySupplierPayment
+    // (indexation based on numeric_mm2krmyr) will reduce the principal balance to ~0, using
+    // the same rounding rules.
+    const principalToClose = round(
+      supplierItem.remainingToPayIsEmpty
+        ? supplierItem.contractualPayment
+        : supplierItem.remainingToPay
+    );
     if (principalToClose <= 0) {
       await updateSupplierCalculationStatus(supplierItem.id, 'כשל');
-      return { success: false, error: 'Invalid remaining-to-pay amount' };
+      return {
+        success: false,
+        error: supplierItem.remainingToPayIsEmpty
+          ? 'Invalid contractual principal amount (formula_mm1t1c7q)'
+          : 'Invalid remaining-to-pay amount (numeric_mm2sqmg9)',
+      };
     }
 
     if (!supplierItem.linkedContractId) {
